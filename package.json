@@ -1,0 +1,34 @@
+{
+  "name": "pi-groupware",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Self-contained pi extension for TU Darmstadt (or any IMAP/SMTP/CalDAV Exchange-style) email and calendar access. No WSL, no himalaya/vdirsyncer/khal.",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "clean": "echo 'nothing to clean'",
+    "build": "echo 'nothing to build (jiti runs TypeScript directly)'",
+    "check": "tsc --noEmit",
+    "smoke": "tsx scripts/smoke.ts"
+  },
+  "dependencies": {
+    "imapflow": "^1.7.8",
+    "mailparser": "^3.7.4",
+    "nodemailer": "^9.1.1",
+    "tsdav": "^2.3.1",
+    "ical.js": "^2.2.1",
+    "@napi-rs/keyring": "^2.0.0"
+  },
+  "devDependencies": {
+    "@types/mailparser": "^3.4.6",
+    "@types/nodemailer": "^8.0.1",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typebox": "^1.3.25",
+    "typescript": "^5.6.0"
+  }
+}
