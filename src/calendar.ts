@@ -94,15 +94,25 @@ export class CalendarClient {
   async listEvents(start: Date, end: Date): Promise<CalendarEvent[]> {
     const client = await this.getClient();
     const calendar = await this.primaryCalendar();
+    // NOTE: TU Darmstadt's CalDAV gateway (Microsoft Exchange) has two quirks that
+    // break tsdav's default fetchCalendarObjects():
+    //  1. Its calendar-query REPORT does not honor a VEVENT comp-filter (with or
+    //     without a time-range) — it matches zero items. A VCALENDAR-only filter
+    //     (i.e. "give me everything") works and returns all objects.
+    //  2. Calendar object hrefs end in ".EML", not ".ics" — tsdav's default
+    //     urlFilter only keeps ".ics" hrefs and silently drops everything.
+    // So: fetch every object unfiltered, then filter/expand recurrences ourselves.
     const objects = await client.fetchCalendarObjects({
       calendar,
-      timeRange: { start: start.toISOString(), end: end.toISOString() },
-      expand: true,
+      filters: [{ "comp-filter": { _attributes: { name: "VCALENDAR" } } }],
+      urlFilter: () => true,
     });
-    return objects.flatMap((obj) => this.parseObject(obj)).sort((a, b) => a.start.localeCompare(b.start));
+    return objects
+      .flatMap((obj) => this.parseObject(obj, start, end))
+      .sort((a, b) => a.start.localeCompare(b.start));
   }
 
-  private parseObject(obj: DAVCalendarObject): CalendarEvent[] {
+  private parseObject(obj: DAVCalendarObject, rangeStart: Date, rangeEnd: Date): CalendarEvent[] {
     if (!obj.data) return [];
     try {
       const jcal = ICAL.parse(obj.data);
@@ -117,27 +127,53 @@ export class CalendarClient {
         }
       }
       const vevents = comp.getAllSubcomponents("vevent");
-      return vevents.map((vevent) => {
-        const event = new ICAL.Event(vevent);
-        const start = event.startDate.toJSDate();
-        const end = event.endDate.toJSDate();
-        return {
-          uid: event.uid,
-          summary: event.summary || undefined,
-          start: start.toISOString(),
-          end: end.toISOString(),
-          allDay: event.startDate.isDate,
-          location: event.location || undefined,
-          description: event.description || undefined,
-          organizer: stringifyPropertyValue(vevent.getFirstPropertyValue("organizer")),
-          status: stringifyPropertyValue(vevent.getFirstPropertyValue("status")),
-          url: obj.url,
-          etag: obj.etag,
-        } satisfies CalendarEvent;
-      });
+      return vevents.flatMap((vevent) => this.expandVevent(vevent, obj, rangeStart, rangeEnd));
     } catch {
       return [];
     }
+  }
+
+  /** Expand a single VEVENT (recurring or not) into concrete occurrences overlapping [rangeStart, rangeEnd]. */
+  private expandVevent(vevent: ICAL.Component, obj: DAVCalendarObject, rangeStart: Date, rangeEnd: Date): CalendarEvent[] {
+    const event = new ICAL.Event(vevent);
+    const toEvent = (uid: string, summary: string | undefined, start: Date, end: Date, allDay: boolean): CalendarEvent => ({
+      uid,
+      summary: summary || undefined,
+      start: start.toISOString(),
+      end: end.toISOString(),
+      allDay,
+      location: event.location || undefined,
+      description: event.description || undefined,
+      organizer: stringifyPropertyValue(vevent.getFirstPropertyValue("organizer")),
+      status: stringifyPropertyValue(vevent.getFirstPropertyValue("status")),
+      url: obj.url,
+      etag: obj.etag,
+    });
+
+    if (!event.isRecurring()) {
+      const start = event.startDate.toJSDate();
+      const end = event.endDate.toJSDate();
+      if (end < rangeStart || start > rangeEnd) return [];
+      return [toEvent(event.uid, event.summary, start, end, event.startDate.isDate)];
+    }
+
+    const results: CalendarEvent[] = [];
+    const iterator = event.iterator();
+    const MAX_OCCURRENCES = 10_000; // safety cap against pathological/unbounded recurrences
+    for (let i = 0; i < MAX_OCCURRENCES; i++) {
+      const next = iterator.next();
+      if (!next) break;
+      const details = event.getOccurrenceDetails(next);
+      const occStart = details.startDate.toJSDate();
+      const occEnd = details.endDate.toJSDate();
+      if (occStart > rangeEnd) break; // occurrences are chronological; nothing further can match
+      const status = stringifyPropertyValue(details.item.component.getFirstPropertyValue("status"));
+      if (status === "CANCELLED") continue;
+      if (occEnd >= rangeStart && occStart <= rangeEnd) {
+        results.push(toEvent(event.uid, details.item.summary, occStart, occEnd, details.startDate.isDate));
+      }
+    }
+    return results;
   }
 
   async createEvent(input: NewEvent): Promise<{ uid: string; url: string }> {

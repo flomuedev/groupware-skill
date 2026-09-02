@@ -86,6 +86,24 @@ Tools available to the LLM (also directly usable, e.g. "check my mail",
 - Only one CalDAV calendar (the account's primary calendar) is queried by
   default; shared/other calendars aren't auto-added.
 
+## Notes on TU Darmstadt's CalDAV quirks
+
+TU's CalDAV gateway is Microsoft Exchange, which has two behaviors that
+`tsdav`'s defaults don't expect and that this extension works around:
+
+- Calendar object hrefs end in `.EML`, not `.ics`.
+- Its `calendar-query` REPORT does not honor a `VEVENT` `comp-filter` (with or
+  without a time-range) — it matches zero items even though matching data
+  exists. A `VCALENDAR`-only filter ("give me everything") works.
+
+So `calendar_list_events`/`calendar_find_free_time` fetch every calendar
+object unfiltered and do date-range filtering and recurrence expansion
+(including per-instance overrides/reschedules and `EXDATE`s) client-side with
+`ical.js`, rather than relying on server-side filtering/expansion. This has
+been cross-checked against the old `khal`/`vdirsyncer` pipeline on a real
+calendar with biweekly recurring meetings, multi-day all-day events, and
+repeatedly-rescheduled instances, and produces identical results.
+
 ## Development
 
 ```bash
