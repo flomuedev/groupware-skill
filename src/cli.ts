@@ -102,6 +102,8 @@ async function promptPassword(question: string): Promise<string> {
 
 async function setup(values: Input) {
   if (!Object.keys(values).length) {
+    const existing = await getDefaultAccount();
+    if (existing) return { configured: existing.primaryEmail, alreadyConfigured: true };
     if (!input.isTTY) throw new Error("Run `groupware setup` in an interactive terminal, or supply JSON input and GROUPWARE_PASSWORD.");
     console.log("TU Darmstadt groupware setup");
     values = {

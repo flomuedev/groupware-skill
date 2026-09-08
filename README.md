@@ -24,6 +24,10 @@ email address, and a hidden password:
 groupware setup
 ```
 
+If an account is already configured, this command reports its email address and
+returns without changing it. To replace or add an account, provide its setup
+configuration explicitly.
+
 For non-interactive automation, set `GROUPWARE_PASSWORD` only for that command
 and pass the JSON configuration. For a custom provider, omit `preset` and supply `label`, `imapHost`,
 `imapPort`, `imapUserTemplate`, `smtpHost`, `smtpPort`, `smtpUserTemplate`,
