@@ -29,6 +29,17 @@ export interface NewEvent {
   description?: string;
 }
 
+export interface EventUpdate extends Partial<NewEvent> {
+  url: string;
+  etag?: string;
+}
+
+export interface CalendarInfo {
+  url: string;
+  displayName?: string;
+  description?: string;
+}
+
 function icalDate(date: Date, allDay: boolean): ICAL.Time {
   if (allDay) {
     return ICAL.Time.fromData({
@@ -54,7 +65,12 @@ export class CalendarClient {
   private account: AccountConfig;
   private password: string;
   private client?: DAVClient;
-  private calendarsCache?: DAVCalendar[];
+  private calendarsCache?: { fetchedAt: number; calendars: DAVCalendar[] };
+  private rangeFetches = new Map<string, Promise<DAVCalendarObject[]>>();
+  private eventsCache = new Map<string, { fetchedAt: number; events: CalendarEvent[] }>();
+
+  private static readonly EVENT_CACHE_MS = 60_000;
+  private static readonly CALENDAR_CACHE_MS = 60_000;
 
   constructor(account: AccountConfig, password: string) {
     this.account = account;
@@ -76,40 +92,81 @@ export class CalendarClient {
   }
 
   async listCalendars(): Promise<DAVCalendar[]> {
-    if (this.calendarsCache) return this.calendarsCache;
+    if (this.calendarsCache && Date.now() - this.calendarsCache.fetchedAt < CalendarClient.CALENDAR_CACHE_MS) {
+      return this.calendarsCache.calendars;
+    }
     const client = await this.getClient();
-    this.calendarsCache = await client.fetchCalendars();
-    return this.calendarsCache;
+    const calendars = await client.fetchCalendars();
+    this.calendarsCache = { fetchedAt: Date.now(), calendars };
+    return calendars;
   }
 
-  private async primaryCalendar(): Promise<DAVCalendar> {
+  async calendarInfos(): Promise<CalendarInfo[]> {
+    return (await this.listCalendars()).map((calendar) => ({ url: calendar.url, displayName: stringifyPropertyValue(calendar.displayName), description: calendar.description }));
+  }
+
+  private async selectCalendar(calendarUrl?: string): Promise<DAVCalendar> {
     const calendars = await this.listCalendars();
     if (calendars.length === 0) throw new Error("No CalDAV calendars found for this account.");
-    // Prefer a calendar whose URL matches the configured account URL (the user's own primary calendar).
+    if (calendarUrl) {
+      const selected = calendars.find((calendar) => calendar.url.replace(/\/$/, "") === calendarUrl.replace(/\/$/, ""));
+      if (!selected) throw new Error("Calendar not found or not accessible to this account.");
+      return selected;
+    }
     const resolved = resolveAccount(this.account);
-    const exact = calendars.find((c) => c.url.replace(/\/$/, "") === resolved.caldavUrl.replace(/\/$/, ""));
-    return exact ?? calendars[0];
+    return calendars.find((c) => c.url.replace(/\/$/, "") === resolved.caldavUrl.replace(/\/$/, "")) ?? calendars[0];
   }
 
-  async listEvents(start: Date, end: Date): Promise<CalendarEvent[]> {
+  async listEvents(start: Date, end: Date, calendarUrl?: string): Promise<CalendarEvent[]> {
+    const calendar = await this.selectCalendar(calendarUrl);
+    const cacheKey = `${calendar.url}:${start.getTime()}:${end.getTime()}`;
+    const cached = this.eventsCache.get(cacheKey);
+    if (cached && Date.now() - cached.fetchedAt < CalendarClient.EVENT_CACHE_MS) return cached.events;
+
     const client = await this.getClient();
-    const calendar = await this.primaryCalendar();
-    // NOTE: TU Darmstadt's CalDAV gateway (Microsoft Exchange) has two quirks that
-    // break tsdav's default fetchCalendarObjects():
-    //  1. Its calendar-query REPORT does not honor a VEVENT comp-filter (with or
-    //     without a time-range) — it matches zero items. A VCALENDAR-only filter
-    //     (i.e. "give me everything") works and returns all objects.
-    //  2. Calendar object hrefs end in ".EML", not ".ics" — tsdav's default
-    //     urlFilter only keeps ".ics" hrefs and silently drops everything.
-    // So: fetch every object unfiltered, then filter/expand recurrences ourselves.
-    const objects = await client.fetchCalendarObjects({
-      calendar,
-      filters: [{ "comp-filter": { _attributes: { name: "VCALENDAR" } } }],
-      urlFilter: () => true,
-    });
-    return objects
-      .flatMap((obj) => this.parseObject(obj, start, end))
-      .sort((a, b) => a.start.localeCompare(b.start));
+    // Exchange correctly honors a nested VEVENT time-range filter. Its objects
+    // use .EML rather than .ics URLs, so override tsdav's .ics-only default.
+    // The server returns recurring masters that overlap the range; ical.js still
+    // expands them locally to preserve exceptions, EXDATEs, and reschedules.
+    const objects = await this.fetchRangeObjects(calendar, client, start, end);
+    const events = objects.flatMap((obj) => this.parseObject(obj, start, end)).sort((a, b) => a.start.localeCompare(b.start));
+    this.eventsCache.set(cacheKey, { fetchedAt: Date.now(), events });
+    return events;
+  }
+
+  /** Search event fields after recurrence expansion, preserving the same date-range semantics as listEvents. */
+  async searchEvents(start: Date, end: Date, text: string, calendarUrl?: string): Promise<CalendarEvent[]> {
+    const needle = text.trim().toLowerCase();
+    if (!needle) throw new Error("Search text is required.");
+    return (await this.listEvents(start, end, calendarUrl)).filter((event) =>
+      [event.summary, event.location, event.description, event.organizer].some((value) => value?.toLowerCase().includes(needle)),
+    );
+  }
+
+  /** Clear the short-lived in-memory event cache after a calendar mutation. */
+  invalidateEventCache(): void {
+    this.eventsCache.clear();
+  }
+
+  private async fetchRangeObjects(
+    calendar: DAVCalendar,
+    client: DAVClient,
+    start: Date,
+    end: Date,
+  ): Promise<DAVCalendarObject[]> {
+    const key = `${start.getTime()}:${end.getTime()}`;
+    const inFlight = this.rangeFetches.get(key);
+    if (inFlight) return inFlight;
+
+    const fetch = client
+      .fetchCalendarObjects({
+        calendar,
+        timeRange: { start: start.toISOString(), end: end.toISOString() },
+        urlFilter: () => true,
+      })
+      .finally(() => this.rangeFetches.delete(key));
+    this.rangeFetches.set(key, fetch);
+    return fetch;
   }
 
   private parseObject(obj: DAVCalendarObject, rangeStart: Date, rangeEnd: Date): CalendarEvent[] {
@@ -176,36 +233,172 @@ export class CalendarClient {
     return results;
   }
 
-  async createEvent(input: NewEvent): Promise<{ uid: string; url: string }> {
+  async createEvent(input: NewEvent, calendarUrl?: string): Promise<{ uid: string; url: string }> {
     const client = await this.getClient();
-    const calendar = await this.primaryCalendar();
-    const allDay = Boolean(input.allDay);
-    const uid = `${randomUUID()}@pi-groupware`;
+    const calendar = await this.selectCalendar(calendarUrl);
+    const uid = `${randomUUID()}@groupware`;
+    const url = await this.storeEvent(calendar, client, uid, this.eventIcs(input, uid));
+    return { uid, url };
+  }
 
+  async getEvent(url: string, calendarUrl?: string): Promise<CalendarEvent> {
+    const calendar = await this.selectCalendar(calendarUrl);
+    const client = await this.getClient();
+    const objects = await client.fetchCalendarObjects({ calendar, objectUrls: [url], urlFilter: () => true });
+    const object = objects[0];
+    if (!object) throw new Error("Calendar event not found.");
+    const event = this.parseObject(object, new Date("1970-01-01T00:00:00.000Z"), new Date("2100-01-01T00:00:00.000Z"))[0];
+    if (!event) throw new Error("Calendar object does not contain a readable event.");
+    return event;
+  }
+
+  /** Update the master event while preserving recurrence rules and attendees. */
+  async updateEvent(input: EventUpdate, calendarUrl?: string): Promise<void> {
+    const calendar = await this.selectCalendar(calendarUrl);
+    const client = await this.getClient();
+    const objects = await client.fetchCalendarObjects({ calendar, objectUrls: [input.url], urlFilter: () => true });
+    const object = objects[0];
+    if (!object?.data) throw new Error("Calendar event not found.");
+    const component = new ICAL.Component(ICAL.parse(object.data));
+    const event = component.getFirstSubcomponent("vevent");
+    if (!event) throw new Error("Calendar object has no VEVENT.");
+    const set = (name: string, value: string | undefined) => {
+      if (value === undefined) return;
+      if (value) event.updatePropertyWithValue(name, value); else event.removeAllProperties(name);
+    };
+    set("summary", input.summary);
+    set("location", input.location);
+    set("description", input.description);
+    if (input.start) event.updatePropertyWithValue("dtstart", icalDate(input.start, Boolean(input.allDay)));
+    if (input.end) event.updatePropertyWithValue("dtend", icalDate(input.end, Boolean(input.allDay)));
+    event.updatePropertyWithValue("dtstamp", ICAL.Time.now());
+    object.data = component.toString();
+    object.etag = input.etag ?? object.etag;
+    const response = await client.updateCalendarObject({ calendarObject: object });
+    if (!response.ok) throw new Error(`CalDAV server rejected event update: HTTP ${response.status}`);
+    this.invalidateEventCache();
+  }
+
+  /**
+   * Create an organizer copy, then use DavMail's schedule-outbox extension
+   * to submit a MIME meeting request through Exchange.
+   */
+  async sendInvite(input: NewEvent & { attendees: string[] }): Promise<{ uid: string; url: string }> {
+    if (input.attendees.length === 0) throw new Error("At least one attendee is required.");
+    const client = await this.getClient();
+    const calendar = await this.selectCalendar();
+    const uid = `${randomUUID()}@groupware`;
+    const localIcs = this.eventIcs(input, uid, input.attendees);
+    const url = await this.storeEvent(calendar, client, uid, localIcs);
+
+    try {
+      await this.submitScheduling(client, this.eventIcs(input, uid, input.attendees, "REQUEST"), "invitation");
+    } catch (error) {
+      // Do not leave an organizer event behind when its invitation was not sent.
+      await this.deleteEvent(url).catch(() => undefined);
+      throw error;
+    }
+    return { uid, url };
+  }
+
+  /** Send an iTIP accept/decline/tentative reply through the CalDAV scheduling outbox. */
+  async respondToInvite(url: string, response: "accepted" | "declined" | "tentative", calendarUrl?: string): Promise<void> {
+    const calendar = await this.selectCalendar(calendarUrl);
+    const client = await this.getClient();
+    const objects = await client.fetchCalendarObjects({ calendar, objectUrls: [url], urlFilter: () => true });
+    const object = objects[0];
+    if (!object?.data) throw new Error("Calendar event not found.");
+
+    const originalCalendar = new ICAL.Component(ICAL.parse(object.data));
+    const original = originalCalendar.getFirstSubcomponent("vevent");
+    if (!original) throw new Error("Calendar object has no VEVENT.");
+    const uid = stringifyPropertyValue(original.getFirstPropertyValue("uid"));
+    const organizer = original.getFirstProperty("organizer");
+    if (!uid || !organizer) throw new Error("This calendar event has no organizer and cannot be answered as an invitation.");
+
+    const replyCalendar = new ICAL.Component(["vcalendar", [], []]);
+    replyCalendar.updatePropertyWithValue("prodid", "-//groupware//EN");
+    replyCalendar.updatePropertyWithValue("version", "2.0");
+    replyCalendar.updatePropertyWithValue("method", "REPLY");
+    const reply = new ICAL.Component("vevent");
+    for (const name of ["uid", "dtstart", "dtend", "organizer"]) {
+      const property = original.getFirstProperty(name);
+      if (property) reply.addProperty(new ICAL.Property(JSON.parse(JSON.stringify(property.toJSON()))));
+    }
+    reply.updatePropertyWithValue("dtstamp", ICAL.Time.now());
+    const attendee = reply.addPropertyWithValue("attendee", `mailto:${this.account.primaryEmail.toLowerCase()}`);
+    attendee.setParameter("partstat", response.toUpperCase());
+    replyCalendar.addSubcomponent(reply);
+
+    await this.submitScheduling(client, replyCalendar.toString(), "response");
+    const ownAttendee = original.getAllProperties("attendee").find((property) =>
+      String(property.getFirstValue()).replace(/^mailto:/i, "").toLowerCase() === this.account.primaryEmail.toLowerCase(),
+    );
+    if (ownAttendee) ownAttendee.setParameter("partstat", response.toUpperCase());
+    else {
+      const localAttendee = original.addPropertyWithValue("attendee", `mailto:${this.account.primaryEmail.toLowerCase()}`);
+      localAttendee.setParameter("partstat", response.toUpperCase());
+    }
+    original.updatePropertyWithValue("dtstamp", ICAL.Time.now());
+    object.data = originalCalendar.toString();
+    const update = await client.updateCalendarObject({ calendarObject: object });
+    if (!update.ok) throw new Error(`CalDAV server accepted the response but rejected the local status update: HTTP ${update.status}`);
+    this.invalidateEventCache();
+  }
+
+  private eventIcs(input: NewEvent, uid: string, attendees?: string[], method?: "REQUEST"): string {
     const comp = new ICAL.Component(["vcalendar", [], []]);
-    comp.updatePropertyWithValue("prodid", "-//pi-groupware//EN");
+    comp.updatePropertyWithValue("prodid", "-//groupware//EN");
     comp.updatePropertyWithValue("version", "2.0");
+    if (method) comp.updatePropertyWithValue("method", method);
 
     const vevent = new ICAL.Component("vevent");
     vevent.updatePropertyWithValue("uid", uid);
     vevent.updatePropertyWithValue("summary", input.summary);
     vevent.updatePropertyWithValue("dtstamp", ICAL.Time.now());
-    vevent.updatePropertyWithValue("dtstart", icalDate(input.start, allDay));
-    vevent.updatePropertyWithValue("dtend", icalDate(input.end, allDay));
+    vevent.updatePropertyWithValue("dtstart", icalDate(input.start, Boolean(input.allDay)));
+    vevent.updatePropertyWithValue("dtend", icalDate(input.end, Boolean(input.allDay)));
     if (input.location) vevent.updatePropertyWithValue("location", input.location);
     if (input.description) vevent.updatePropertyWithValue("description", input.description);
-    comp.addSubcomponent(vevent);
-
-    const filename = `${uid}.ics`;
-    const response = await client.createCalendarObject({
-      calendar,
-      iCalString: comp.toString(),
-      filename,
-    });
-    if (!response.ok) {
-      throw new Error(`CalDAV server rejected event creation: HTTP ${response.status} ${await response.text()}`);
+    if (attendees?.length) {
+      vevent.updatePropertyWithValue("organizer", `mailto:${this.account.primaryEmail}`);
+      for (const email of attendees) {
+        const attendee = vevent.addPropertyWithValue("attendee", `mailto:${email}`);
+        attendee.setParameter("partstat", "NEEDS-ACTION");
+        attendee.setParameter("rsvp", "TRUE");
+      }
     }
-    return { uid, url: new URL(filename, calendar.url).href };
+    comp.addSubcomponent(vevent);
+    return comp.toString();
+  }
+
+  private async storeEvent(calendar: DAVCalendar, client: DAVClient, uid: string, iCalString: string): Promise<string> {
+    const filename = `${uid}.ics`;
+    const response = await client.createCalendarObject({ calendar, iCalString, filename });
+    if (!response.ok) throw new Error(`CalDAV server rejected event creation: HTTP ${response.status} ${await response.text()}`);
+    this.invalidateEventCache();
+    return new URL(filename, calendar.url).href;
+  }
+
+  private async submitScheduling(client: DAVClient, iCalString: string, label: string): Promise<void> {
+    const outboxUrl = await this.scheduleOutboxUrl(client);
+    const resolved = resolveAccount(this.account);
+    const authorization = Buffer.from(`${resolved.caldavUser}:${this.password}`).toString("base64");
+    const response = await fetch(outboxUrl, {
+      method: "POST",
+      headers: { Authorization: `Basic ${authorization}`, "Content-Type": "text/calendar; charset=utf-8" },
+      body: iCalString,
+    });
+    if (!response.ok) throw new Error(`CalDAV scheduling outbox rejected ${label}: HTTP ${response.status} ${await response.text()}`);
+  }
+
+  private async scheduleOutboxUrl(client: DAVClient): Promise<string> {
+    const resolved = resolveAccount(this.account);
+    const principalUrl = new URL(`/principals/users/${this.account.primaryEmail.toLowerCase()}/`, resolved.caldavUrl).href;
+    const responses = await client.propfind({ url: principalUrl, depth: "0", props: { "c:schedule-outbox-URL": {} } });
+    const href = responses.find((response) => response.ok)?.props?.scheduleOutboxURL?.href;
+    if (typeof href !== "string" || !href) throw new Error("CalDAV server does not expose a scheduling outbox.");
+    return new URL(href, principalUrl).href;
   }
 
   async deleteEvent(url: string, etag?: string): Promise<void> {
@@ -214,5 +407,6 @@ export class CalendarClient {
     if (!response.ok && response.status !== 404) {
       throw new Error(`CalDAV server rejected event deletion: HTTP ${response.status}`);
     }
+    this.invalidateEventCache();
   }
 }

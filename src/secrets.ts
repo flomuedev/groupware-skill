@@ -8,7 +8,7 @@
  * native keyring module fails to load on an unsupported platform.
  */
 
-const SERVICE = "pi-groupware";
+const SERVICE = "groupware";
 
 type KeyringEntry = {
   getPassword(): string | null;

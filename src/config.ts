@@ -32,7 +32,9 @@ export interface AccountConfig {
     sent?: string;
     drafts?: string;
     trash?: string;
+    archive?: string;
   };
+
 }
 
 export const TU_DARMSTADT_DEFAULTS: Omit<AccountConfig, "loginId" | "primaryEmail" | "folders"> = {
@@ -55,7 +57,7 @@ export interface RootConfig {
 }
 
 function configDir(): string {
-  return join(homedir(), ".pi-groupware");
+  return join(homedir(), ".groupware");
 }
 
 function configPath(): string {

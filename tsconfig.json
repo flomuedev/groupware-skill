@@ -9,10 +9,7 @@
     "esModuleInterop": true,
     "resolveJsonModule": true,
     "types": ["node"],
-    "noEmit": true,
-    "paths": {
-      "@earendil-works/pi-coding-agent": ["./types/pi-coding-agent-stub.d.ts"]
-    }
+    "noEmit": true
   },
-  "include": ["src", "scripts", "types"]
+  "include": ["src/cli.ts", "src/calendar.ts", "src/config.ts", "src/mail.ts", "src/secrets.ts"]
 }
