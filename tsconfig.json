@@ -11,5 +11,5 @@
     "types": ["node"],
     "noEmit": true
   },
-  "include": ["src/cli.ts", "src/calendar.ts", "src/config.ts", "src/mail.ts", "src/secrets.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts"]
 }

@@ -11,10 +11,14 @@ export interface CalendarEvent {
   start: string; // ISO string
   end: string; // ISO string
   allDay: boolean;
+  /** True when this object represents a recurring series. Updating it changes every occurrence. */
+  isRecurring: boolean;
   location?: string;
   description?: string;
   organizer?: string;
   status?: string;
+  /** A transparent event does not block availability. */
+  transparent: boolean;
   /** URL and etag of the underlying calendar object, needed to delete/update it. */
   url: string;
   etag?: string;
@@ -31,7 +35,10 @@ export interface NewEvent {
 
 export interface EventUpdate extends Partial<NewEvent> {
   url: string;
-  etag?: string;
+  /** ETag returned by calendar-list/get; prevents overwriting a newer change. */
+  etag: string;
+  /** Required to update a recurring series rather than a single non-recurring event. */
+  allowSeriesUpdate?: boolean;
 }
 
 export interface CalendarInfo {
@@ -40,14 +47,45 @@ export interface CalendarInfo {
   description?: string;
 }
 
-function icalDate(date: Date, allDay: boolean): ICAL.Time {
+function assertDateRange(start: Date, end: Date): void {
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end <= start) {
+    throw new Error("Event end must be after its start, and both must be valid dates.");
+  }
+}
+
+function timezoneParts(date: Date, timezone: string): Record<string, number> {
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: timezone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(date);
+  return Object.fromEntries(parts.filter((part) => part.type !== "literal").map((part) => [part.type, Number(part.value)]));
+}
+
+/** Convert a calendar date in an account timezone to its corresponding absolute midnight. */
+export function accountMidnight(year: number, month: number, day: number, timezone: string): Date {
+  const wanted = Date.UTC(year, month - 1, day);
+  let instant = wanted;
+  for (let i = 0; i < 3; i++) {
+    const actual = timezoneParts(new Date(instant), timezone);
+    const offset = wanted - Date.UTC(actual.year, actual.month - 1, actual.day, actual.hour, actual.minute);
+    if (offset === 0) break;
+    instant += offset;
+  }
+  return new Date(instant);
+}
+
+function timeToDate(time: ICAL.Time, timezone: string): Date {
+  return time.isDate ? accountMidnight(time.year, time.month, time.day, timezone) : time.toJSDate();
+}
+
+function nextDate(time: ICAL.Time): ICAL.Time {
+  const date = new Date(Date.UTC(time.year, time.month - 1, time.day + 1));
+  return ICAL.Time.fromData({ year: date.getUTCFullYear(), month: date.getUTCMonth() + 1, day: date.getUTCDate(), isDate: true });
+}
+
+export function icalDate(date: Date, allDay: boolean, timezone?: string): ICAL.Time {
   if (allDay) {
-    return ICAL.Time.fromData({
-      year: date.getFullYear(),
-      month: date.getMonth() + 1,
-      day: date.getDate(),
-      isDate: true,
-    });
+    if (!timezone) throw new Error("Account timezone is required for an all-day event.");
+    const parts = new Intl.DateTimeFormat("en-CA", { timeZone: timezone, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(date);
+    const values = Object.fromEntries(parts.filter((part) => part.type !== "literal").map((part) => [part.type, Number(part.value)]));
+    return ICAL.Time.fromData({ year: values.year, month: values.month, day: values.day, isDate: true });
   }
   // Always emit an absolute UTC instant ("...Z"). This avoids depending on the
   // VTIMEZONE database being registered and is unambiguous for any CalDAV server.
@@ -59,6 +97,27 @@ function stringifyPropertyValue(value: unknown): string | undefined {
   if (typeof value === "string") return value;
   if (typeof value === "object" && "toString" in value) return String(value);
   return undefined;
+}
+
+/** Reject server-supplied outbox URLs before credentials are attached to a request. */
+export function trustedSchedulingOutboxUrl(href: string, principalUrl: string, configuredCaldavUrl: string): string {
+  const outboxUrl = new URL(href, principalUrl);
+  const configuredUrl = new URL(configuredCaldavUrl);
+  if (outboxUrl.protocol !== "https:" || outboxUrl.origin !== configuredUrl.origin) {
+    throw new Error("CalDAV server returned a scheduling outbox outside the configured HTTPS origin.");
+  }
+  return outboxUrl.href;
+}
+
+/** Ensure a destructive request stays inside a selected, accessible calendar collection. */
+export function trustedCalendarObjectUrl(value: string, calendarUrl: string): string {
+  const calendar = new URL(calendarUrl);
+  const object = new URL(value, calendar);
+  const calendarPath = calendar.pathname.endsWith("/") ? calendar.pathname : `${calendar.pathname}/`;
+  if (object.protocol !== "https:" || object.origin !== calendar.origin || !object.pathname.startsWith(calendarPath)) {
+    throw new Error("Calendar event URL is outside the selected HTTPS calendar.");
+  }
+  return object.href;
 }
 
 export class CalendarClient {
@@ -154,7 +213,7 @@ export class CalendarClient {
     start: Date,
     end: Date,
   ): Promise<DAVCalendarObject[]> {
-    const key = `${start.getTime()}:${end.getTime()}`;
+    const key = `${calendar.url}:${start.getTime()}:${end.getTime()}`;
     const inFlight = this.rangeFetches.get(key);
     if (inFlight) return inFlight;
 
@@ -185,33 +244,36 @@ export class CalendarClient {
       }
       const vevents = comp.getAllSubcomponents("vevent");
       return vevents.flatMap((vevent) => this.expandVevent(vevent, obj, rangeStart, rangeEnd));
-    } catch {
-      return [];
+    } catch (error) {
+      throw new Error(`Unable to parse calendar event ${obj.url}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
   /** Expand a single VEVENT (recurring or not) into concrete occurrences overlapping [rangeStart, rangeEnd]. */
   private expandVevent(vevent: ICAL.Component, obj: DAVCalendarObject, rangeStart: Date, rangeEnd: Date): CalendarEvent[] {
     const event = new ICAL.Event(vevent);
-    const toEvent = (uid: string, summary: string | undefined, start: Date, end: Date, allDay: boolean): CalendarEvent => ({
+    const toEvent = (uid: string, summary: string | undefined, start: Date, end: Date, allDay: boolean, status?: string): CalendarEvent => ({
       uid,
       summary: summary || undefined,
       start: start.toISOString(),
       end: end.toISOString(),
       allDay,
+      isRecurring: event.isRecurring(),
       location: event.location || undefined,
       description: event.description || undefined,
       organizer: stringifyPropertyValue(vevent.getFirstPropertyValue("organizer")),
-      status: stringifyPropertyValue(vevent.getFirstPropertyValue("status")),
+      status: status ?? stringifyPropertyValue(vevent.getFirstPropertyValue("status")),
+      transparent: stringifyPropertyValue(vevent.getFirstPropertyValue("transp")) === "TRANSPARENT",
       url: obj.url,
       etag: obj.etag,
     });
 
     if (!event.isRecurring()) {
-      const start = event.startDate.toJSDate();
-      const end = event.endDate.toJSDate();
-      if (end < rangeStart || start > rangeEnd) return [];
-      return [toEvent(event.uid, event.summary, start, end, event.startDate.isDate)];
+      const start = timeToDate(event.startDate, this.account.timezone);
+      const end = timeToDate(event.endDate, this.account.timezone);
+      const status = stringifyPropertyValue(vevent.getFirstPropertyValue("status"));
+      if (status === "CANCELLED" || end < rangeStart || start > rangeEnd) return [];
+      return [toEvent(event.uid, event.summary, start, end, event.startDate.isDate, status)];
     }
 
     const results: CalendarEvent[] = [];
@@ -221,19 +283,20 @@ export class CalendarClient {
       const next = iterator.next();
       if (!next) break;
       const details = event.getOccurrenceDetails(next);
-      const occStart = details.startDate.toJSDate();
-      const occEnd = details.endDate.toJSDate();
+      const occStart = timeToDate(details.startDate, this.account.timezone);
+      const occEnd = timeToDate(details.endDate, this.account.timezone);
       if (occStart > rangeEnd) break; // occurrences are chronological; nothing further can match
       const status = stringifyPropertyValue(details.item.component.getFirstPropertyValue("status"));
       if (status === "CANCELLED") continue;
       if (occEnd >= rangeStart && occStart <= rangeEnd) {
-        results.push(toEvent(event.uid, details.item.summary, occStart, occEnd, details.startDate.isDate));
+        results.push(toEvent(event.uid, details.item.summary, occStart, occEnd, details.startDate.isDate, status));
       }
     }
     return results;
   }
 
   async createEvent(input: NewEvent, calendarUrl?: string): Promise<{ uid: string; url: string }> {
+    assertDateRange(input.start, input.end);
     const client = await this.getClient();
     const calendar = await this.selectCalendar(calendarUrl);
     const uid = `${randomUUID()}@groupware`;
@@ -244,7 +307,8 @@ export class CalendarClient {
   async getEvent(url: string, calendarUrl?: string): Promise<CalendarEvent> {
     const calendar = await this.selectCalendar(calendarUrl);
     const client = await this.getClient();
-    const objects = await client.fetchCalendarObjects({ calendar, objectUrls: [url], urlFilter: () => true });
+    const safeUrl = trustedCalendarObjectUrl(url, calendar.url);
+    const objects = await client.fetchCalendarObjects({ calendar, objectUrls: [safeUrl], urlFilter: () => true });
     const object = objects[0];
     if (!object) throw new Error("Calendar event not found.");
     const event = this.parseObject(object, new Date("1970-01-01T00:00:00.000Z"), new Date("2100-01-01T00:00:00.000Z"))[0];
@@ -256,12 +320,20 @@ export class CalendarClient {
   async updateEvent(input: EventUpdate, calendarUrl?: string): Promise<void> {
     const calendar = await this.selectCalendar(calendarUrl);
     const client = await this.getClient();
-    const objects = await client.fetchCalendarObjects({ calendar, objectUrls: [input.url], urlFilter: () => true });
+    const safeUrl = trustedCalendarObjectUrl(input.url, calendar.url);
+    const objects = await client.fetchCalendarObjects({ calendar, objectUrls: [safeUrl], urlFilter: () => true });
     const object = objects[0];
     if (!object?.data) throw new Error("Calendar event not found.");
     const component = new ICAL.Component(ICAL.parse(object.data));
     const event = component.getFirstSubcomponent("vevent");
     if (!event) throw new Error("Calendar object has no VEVENT.");
+    const existingEvent = new ICAL.Event(event);
+    if (existingEvent.isRecurring() && !input.allowSeriesUpdate) {
+      throw new Error("This is a recurring series. Refusing to change every occurrence without allowSeriesUpdate:true.");
+    }
+    const existingStart = timeToDate(existingEvent.startDate, this.account.timezone);
+    const existingEnd = timeToDate(existingEvent.endDate, this.account.timezone);
+    if (input.start || input.end) assertDateRange(input.start ?? existingStart, input.end ?? existingEnd);
     const set = (name: string, value: string | undefined) => {
       if (value === undefined) return;
       if (value) event.updatePropertyWithValue(name, value); else event.removeAllProperties(name);
@@ -269,11 +341,27 @@ export class CalendarClient {
     set("summary", input.summary);
     set("location", input.location);
     set("description", input.description);
-    if (input.start) event.updatePropertyWithValue("dtstart", icalDate(input.start, Boolean(input.allDay)));
-    if (input.end) event.updatePropertyWithValue("dtend", icalDate(input.end, Boolean(input.allDay)));
+    const allDay = input.allDay ?? existingEvent.startDate.isDate;
+    // A type change must rewrite both values: otherwise a DATE and DATE-TIME
+    // can be mixed, or an allDay-only request can appear to succeed unchanged.
+    if (input.allDay !== undefined) {
+      const start = input.start ?? existingStart;
+      const end = input.end ?? existingEnd;
+      let startValue = icalDate(start, allDay, this.account.timezone);
+      let endValue = icalDate(end, allDay, this.account.timezone);
+      if (allDay && endValue.compare(startValue) <= 0) endValue = nextDate(startValue);
+      event.updatePropertyWithValue("dtstart", startValue);
+      event.updatePropertyWithValue("dtend", endValue);
+    } else {
+      if (input.start) event.updatePropertyWithValue("dtstart", icalDate(input.start, allDay, this.account.timezone));
+      if (input.end) event.updatePropertyWithValue("dtend", icalDate(input.end, allDay, this.account.timezone));
+    }
     event.updatePropertyWithValue("dtstamp", ICAL.Time.now());
+    const sequence = Number(event.getFirstPropertyValue("sequence") ?? 0);
+    event.updatePropertyWithValue("sequence", Number.isFinite(sequence) ? sequence + 1 : 1);
     object.data = component.toString();
-    object.etag = input.etag ?? object.etag;
+    object.url = safeUrl;
+    object.etag = input.etag;
     const response = await client.updateCalendarObject({ calendarObject: object });
     if (!response.ok) throw new Error(`CalDAV server rejected event update: HTTP ${response.status}`);
     this.invalidateEventCache();
@@ -285,6 +373,7 @@ export class CalendarClient {
    */
   async sendInvite(input: NewEvent & { attendees: string[] }): Promise<{ uid: string; url: string }> {
     if (input.attendees.length === 0) throw new Error("At least one attendee is required.");
+    assertDateRange(input.start, input.end);
     const client = await this.getClient();
     const calendar = await this.selectCalendar();
     const uid = `${randomUUID()}@groupware`;
@@ -295,7 +384,8 @@ export class CalendarClient {
       await this.submitScheduling(client, this.eventIcs(input, uid, input.attendees, "REQUEST"), "invitation");
     } catch (error) {
       // Do not leave an organizer event behind when its invitation was not sent.
-      await this.deleteEvent(url).catch(() => undefined);
+      const created = await this.getEvent(url).catch(() => undefined);
+      if (created?.etag) await this.deleteEvent(url, created.etag).catch(() => undefined);
       throw error;
     }
     return { uid, url };
@@ -305,7 +395,8 @@ export class CalendarClient {
   async respondToInvite(url: string, response: "accepted" | "declined" | "tentative", calendarUrl?: string): Promise<void> {
     const calendar = await this.selectCalendar(calendarUrl);
     const client = await this.getClient();
-    const objects = await client.fetchCalendarObjects({ calendar, objectUrls: [url], urlFilter: () => true });
+    const safeUrl = trustedCalendarObjectUrl(url, calendar.url);
+    const objects = await client.fetchCalendarObjects({ calendar, objectUrls: [safeUrl], urlFilter: () => true });
     const object = objects[0];
     if (!object?.data) throw new Error("Calendar event not found.");
 
@@ -341,6 +432,7 @@ export class CalendarClient {
     }
     original.updatePropertyWithValue("dtstamp", ICAL.Time.now());
     object.data = originalCalendar.toString();
+    object.url = safeUrl;
     const update = await client.updateCalendarObject({ calendarObject: object });
     if (!update.ok) throw new Error(`CalDAV server accepted the response but rejected the local status update: HTTP ${update.status}`);
     this.invalidateEventCache();
@@ -356,8 +448,11 @@ export class CalendarClient {
     vevent.updatePropertyWithValue("uid", uid);
     vevent.updatePropertyWithValue("summary", input.summary);
     vevent.updatePropertyWithValue("dtstamp", ICAL.Time.now());
-    vevent.updatePropertyWithValue("dtstart", icalDate(input.start, Boolean(input.allDay)));
-    vevent.updatePropertyWithValue("dtend", icalDate(input.end, Boolean(input.allDay)));
+    const start = icalDate(input.start, Boolean(input.allDay), this.account.timezone);
+    let end = icalDate(input.end, Boolean(input.allDay), this.account.timezone);
+    if (input.allDay && end.compare(start) <= 0) end = nextDate(start);
+    vevent.updatePropertyWithValue("dtstart", start);
+    vevent.updatePropertyWithValue("dtend", end);
     if (input.location) vevent.updatePropertyWithValue("location", input.location);
     if (input.description) vevent.updatePropertyWithValue("description", input.description);
     if (attendees?.length) {
@@ -375,7 +470,7 @@ export class CalendarClient {
   private async storeEvent(calendar: DAVCalendar, client: DAVClient, uid: string, iCalString: string): Promise<string> {
     const filename = `${uid}.ics`;
     const response = await client.createCalendarObject({ calendar, iCalString, filename });
-    if (!response.ok) throw new Error(`CalDAV server rejected event creation: HTTP ${response.status} ${await response.text()}`);
+    if (!response.ok) throw new Error(`CalDAV server rejected event creation: HTTP ${response.status}`);
     this.invalidateEventCache();
     return new URL(filename, calendar.url).href;
   }
@@ -389,21 +484,25 @@ export class CalendarClient {
       headers: { Authorization: `Basic ${authorization}`, "Content-Type": "text/calendar; charset=utf-8" },
       body: iCalString,
     });
-    if (!response.ok) throw new Error(`CalDAV scheduling outbox rejected ${label}: HTTP ${response.status} ${await response.text()}`);
+    if (!response.ok) throw new Error(`CalDAV scheduling outbox rejected ${label}: HTTP ${response.status}`);
   }
 
   private async scheduleOutboxUrl(client: DAVClient): Promise<string> {
     const resolved = resolveAccount(this.account);
-    const principalUrl = new URL(`/principals/users/${this.account.primaryEmail.toLowerCase()}/`, resolved.caldavUrl).href;
+    const principalUrl = client.account?.principalUrl;
+    if (!principalUrl) throw new Error("CalDAV client did not discover the account principal URL.");
     const responses = await client.propfind({ url: principalUrl, depth: "0", props: { "c:schedule-outbox-URL": {} } });
     const href = responses.find((response) => response.ok)?.props?.scheduleOutboxURL?.href;
     if (typeof href !== "string" || !href) throw new Error("CalDAV server does not expose a scheduling outbox.");
-    return new URL(href, principalUrl).href;
+    return trustedSchedulingOutboxUrl(href, principalUrl, resolved.caldavUrl);
   }
 
-  async deleteEvent(url: string, etag?: string): Promise<void> {
+  async deleteEvent(url: string, etag: string, calendarUrl?: string): Promise<void> {
+    if (!etag) throw new Error("An ETag from calendar-list/get is required to delete an event.");
+    const calendar = await this.selectCalendar(calendarUrl);
+    const safeUrl = trustedCalendarObjectUrl(url, calendar.url);
     const client = await this.getClient();
-    const response = await client.deleteCalendarObject({ calendarObject: { url, etag: etag ?? "" } as DAVCalendarObject });
+    const response = await client.deleteCalendarObject({ calendarObject: { url: safeUrl, etag } as DAVCalendarObject });
     if (!response.ok && response.status !== 404) {
       throw new Error(`CalDAV server rejected event deletion: HTTP ${response.status}`);
     }

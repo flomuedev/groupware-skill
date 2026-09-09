@@ -27,6 +27,7 @@ export interface MessageDetail extends MessageSummary {
   text?: string;
   /** Present only when explicitly requested; HTML bodies can be very large. */
   html?: string;
+  bodyTruncated?: boolean;
   cc?: string[];
   inReplyTo?: string;
   references?: string[];
@@ -61,7 +62,8 @@ export interface AttachmentInfo {
 }
 
 export interface AttachmentContent extends AttachmentInfo {
-  contentBase64: string;
+  contentBase64?: string;
+  contentOmitted?: boolean;
 }
 
 function envelopeToAddresses(list?: Array<{ address?: string; name?: string }>): string[] {
@@ -149,6 +151,7 @@ export class MailClient {
       const folders = await this.listFolders();
       const found = folders.find((f) => f.specialUse === wanted);
       if (found) return found.path;
+      throw new Error(`The logical ${key} mailbox is not configured. Run groupware mail-folders and supply its literal path.`);
     }
     return name; // treat as a literal path
   }
@@ -194,7 +197,7 @@ export class MailClient {
     });
   }
 
-  async readMessage(folder: string, uid: number, includeHtml = false): Promise<MessageDetail> {
+  async readMessage(folder: string, uid: number, includeHtml = false, maxBytes = 1_000_000): Promise<MessageDetail> {
     const path = await this.resolveFolder(folder);
     return this.withImap(async (client) => {
       await client.mailboxOpen(path);
@@ -204,13 +207,20 @@ export class MailClient {
       let text: string | undefined;
       let html: string | undefined;
       let references: string[] | undefined;
+      let bodyTruncated = false;
+      const truncate = (value: string | undefined) => {
+        if (!value || Buffer.byteLength(value) <= maxBytes) return value;
+        bodyTruncated = true;
+        return Buffer.from(value).subarray(0, maxBytes).toString("utf8") + "\n[Content truncated]";
+      };
       if (msg.source) {
         const { simpleParser } = await import("mailparser");
         const parsed = await simpleParser(msg.source);
-        text = parsed.text ?? undefined;
-        html = includeHtml && typeof parsed.html === "string" ? parsed.html : undefined;
+        text = truncate(parsed.text ?? undefined);
+        html = includeHtml && typeof parsed.html === "string" ? truncate(parsed.html) : undefined;
         const value = parsed.headers.get("references");
-        references = typeof value === "string" ? value.split(/\s+/).filter(Boolean) : undefined;
+        const parsedReferences = (typeof value === "string" ? value.split(/\s+/) : Array.isArray(value) ? value.flatMap((item) => String(item).split(/\s+/)) : []).filter(Boolean);
+        references = parsedReferences.length ? parsedReferences : undefined;
       }
 
       return {
@@ -220,6 +230,7 @@ export class MailClient {
         cc: envelopeToAddresses(msg.envelope?.cc),
         inReplyTo: msg.envelope?.inReplyTo ?? undefined,
         references,
+        bodyTruncated: bodyTruncated || undefined,
       };
     });
   }
@@ -234,8 +245,9 @@ export class MailClient {
       try {
         const messages = await this.search(folder, query, limit);
         results.push(...messages.map((message) => ({ ...message, folder })));
-      } catch {
-        // An optional logical folder (notably archive) may not exist on every server.
+      } catch (error) {
+        if (!(error instanceof Error) || !error.message.includes("logical archive mailbox is not configured")) throw error;
+        // Archive is optional; other failures must be visible rather than looking like no results.
       }
     }
     const threads = new Map<string, ThreadSummary>();
@@ -279,11 +291,13 @@ export class MailClient {
     return message.attachments.map((attachment, index) => ({ index, filename: attachment.filename || undefined, contentType: attachment.contentType, size: attachment.size }));
   }
 
-  async downloadAttachment(folder: string, uid: number, index: number): Promise<AttachmentContent> {
+  async downloadAttachment(folder: string, uid: number, index: number, maxBytes = 1_000_000): Promise<AttachmentContent> {
     const message = await this.readParsed(folder, uid);
     const attachment = message.attachments[index];
     if (!attachment) throw new Error(`Attachment ${index} not found on message uid ${uid}.`);
-    return { index, filename: attachment.filename || undefined, contentType: attachment.contentType, size: attachment.size, contentBase64: attachment.content.toString("base64") };
+    const info = { index, filename: attachment.filename || undefined, contentType: attachment.contentType, size: attachment.size };
+    if (attachment.size > maxBytes) return { ...info, contentOmitted: true };
+    return { ...info, contentBase64: attachment.content.toString("base64") };
   }
 
   async getThread(folder: string, uid: number, limit = 100): Promise<ThreadMessage[]> {
@@ -300,7 +314,9 @@ export class MailClient {
             const message = { ...summarize(msg), folder: path };
             found.set(`${path}:${msg.uid}`, message);
           }
-        } catch { /* optional folders may not exist */ }
+        } catch (error) {
+          if (!(error instanceof Error) || !error.message.includes("logical archive mailbox is not configured")) throw error;
+        }
       }
       if (!found.size) found.set(`${folder}:${uid}`, { ...original, folder });
       return [...found.values()].sort((a, b) => (a.date ?? "").localeCompare(b.date ?? ""));
@@ -328,7 +344,7 @@ export class MailClient {
   }
 
   /** Compose a message once, send it via SMTP, and optionally append the exact same bytes to a mailbox (e.g. Sent). */
-  async send(opts: SendOptions): Promise<{ messageId: string; savedTo?: string }> {
+  async send(opts: SendOptions): Promise<{ messageId: string; savedTo?: string; saveWarning?: string }> {
     const raw = await this.compose(opts);
     const resolved = resolveAccount(this.account);
     const transport = nodemailer.createTransport({
@@ -343,14 +359,19 @@ export class MailClient {
     transport.close();
 
     let savedTo: string | undefined;
+    let saveWarning: string | undefined;
     if (opts.saveToFolder) {
-      const path = await this.resolveFolder(opts.saveToFolder);
-      await this.withImap(async (client) => {
-        await client.append(path, raw, ["\\Seen"]);
-      });
-      savedTo = path;
+      try {
+        const path = await this.resolveFolder(opts.saveToFolder);
+        await this.withImap(async (client) => {
+          await client.append(path, raw, ["\\Seen"]);
+        });
+        savedTo = path;
+      } catch (error) {
+        saveWarning = `Email was sent, but saving a copy to Sent failed: ${error instanceof Error ? error.message : String(error)}`;
+      }
     }
 
-    return { messageId: info.messageId, savedTo };
+    return { messageId: info.messageId, savedTo, saveWarning };
   }
 }

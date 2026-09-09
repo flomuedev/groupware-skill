@@ -1,14 +1,18 @@
 {
   "name": "groupware-skill",
-  "private": true,
   "version": "0.1.0",
   "description": "Host-neutral Agent Skill for IMAP, SMTP, and CalDAV groupware access.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
   "type": "module",
   "bin": {
     "groupware": "./bin/groupware.mjs"
   },
   "scripts": {
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "tsx --test test/**/*.test.ts"
   },
   "dependencies": {
     "@napi-rs/keyring": "^2.0.0",

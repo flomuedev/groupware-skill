@@ -100,7 +100,10 @@ export async function upsertAccount(account: AccountConfig): Promise<void> {
 }
 
 export function fillTemplate(template: string, values: Record<string, string>): string {
-  return template.replace(/\{(\w+)\}/g, (_, key) => values[key] ?? "");
+  return template.replace(/\{(\w+)\}/g, (_, key) => {
+    if (!(key in values)) throw new Error(`Unknown template variable: {${key}}`);
+    return values[key];
+  });
 }
 
 export function resolveAccount(account: AccountConfig) {

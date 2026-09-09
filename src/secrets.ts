@@ -4,8 +4,8 @@
  *  - macOS: Keychain
  *  - Linux: Secret Service (gnome-keyring / kwallet via libsecret)
  *
- * Falls back to an in-memory-only prompt (never persisted to disk) if the
- * native keyring module fails to load on an unsupported platform.
+ * Setup fails rather than persisting a password if the native keyring module
+ * cannot load on the current platform.
  */
 
 const SERVICE = "groupware";

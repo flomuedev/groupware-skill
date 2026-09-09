@@ -7,12 +7,17 @@ import { MailClient } from "./mail.ts";
 import { CalendarClient } from "./calendar.ts";
 
 type Input = Record<string, unknown>;
+type InputSource = "arguments" | "stdin" | "none";
 
-async function readInput(): Promise<Input> {
-  const raw = process.argv.slice(3).join(" ") || (await readStdin());
-  if (!raw.trim()) return {};
+async function readInput(): Promise<{ values: Input; source: InputSource }> {
+  const argumentInput = process.argv.slice(3).join(" ");
+  const source: InputSource = argumentInput ? "arguments" : input.isTTY ? "none" : "stdin";
+  const raw = argumentInput || (await readStdin());
+  if (!raw.trim()) return { values: {}, source };
   try {
-    return JSON.parse(raw) as Input;
+    const values = JSON.parse(raw) as unknown;
+    if (!values || Array.isArray(values) || typeof values !== "object") throw new Error();
+    return { values: values as Input, source };
   } catch {
     throw new Error("Input must be a JSON object, supplied after the command or on stdin.");
   }
@@ -20,9 +25,25 @@ async function readInput(): Promise<Input> {
 
 async function readStdin(): Promise<string> {
   if (input.isTTY) return "";
-  const chunks: Buffer[] = [];
-  for await (const chunk of input) chunks.push(Buffer.from(chunk));
-  return Buffer.concat(chunks).toString("utf8");
+  // Some agent harnesses leave stdin as an open pipe even when no JSON was
+  // supplied. Do not let a no-argument command wait forever for its first byte.
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const timeout = setTimeout(() => { cleanup(); input.pause(); resolve(""); }, 2_000);
+    const cleanup = () => {
+      clearTimeout(timeout);
+      input.removeListener("data", onData);
+      input.removeListener("end", onEnd);
+      input.removeListener("error", onError);
+    };
+    const onData = (chunk: Buffer) => { clearTimeout(timeout); chunks.push(Buffer.from(chunk)); };
+    const onEnd = () => { cleanup(); resolve(Buffer.concat(chunks).toString("utf8")); };
+    const onError = (error: Error) => { cleanup(); reject(error); };
+    input.on("data", onData);
+    input.once("end", onEnd);
+    input.once("error", onError);
+    input.resume();
+  });
 }
 
 function string(value: unknown, name: string): string {
@@ -100,10 +121,12 @@ async function promptPassword(question: string): Promise<string> {
   });
 }
 
-async function setup(values: Input) {
+async function setup(values: Input, source: InputSource) {
+  let interactivePassword: string | undefined;
   if (!Object.keys(values).length) {
     const existing = await getDefaultAccount();
-    if (existing) return { configured: existing.primaryEmail, alreadyConfigured: true };
+    if (existing && await getPassword(existing.primaryEmail)) return { configured: existing.primaryEmail, alreadyConfigured: true };
+    if (existing) console.log(`Credential-store password for ${existing.primaryEmail} is unavailable; enter setup details to restore it.`);
     if (!input.isTTY) throw new Error("Run `groupware setup` in an interactive terminal, or supply JSON input and GROUPWARE_PASSWORD.");
     console.log("TU Darmstadt groupware setup");
     values = {
@@ -112,9 +135,13 @@ async function setup(values: Input) {
       primaryEmail: await prompt("Primary email address: "),
       password: await promptPassword("Password (input hidden): "),
     };
+    interactivePassword = values.password as string;
+  }
+  if (source !== "none" && typeof values.password === "string") {
+    throw new Error("Do not provide passwords in JSON input. Use GROUPWARE_PASSWORD for this command or interactive setup.");
   }
   const preset = values.preset === "tu-darmstadt";
-  const password = typeof values.password === "string" ? values.password : process.env.GROUPWARE_PASSWORD;
+  const password = interactivePassword ?? process.env.GROUPWARE_PASSWORD;
   if (!password) throw new Error("Enter a password in interactive setup, or set GROUPWARE_PASSWORD only for this setup command; it is stored in the OS keychain, not the config file.");
   const loginId = string(values.loginId, "loginId");
   const primaryEmail = string(values.primaryEmail, "primaryEmail").toLowerCase();
@@ -133,7 +160,7 @@ async function setup(values: Input) {
   const mail = new MailClient(account, password);
   const folders = await mail.listFolders();
   const special = (flag: string) => folders.find((folder) => folder.specialUse === flag)?.path;
-  account.folders = { inbox: special("\\Inbox") ?? "INBOX", sent: special("\\Sent"), drafts: special("\\Drafts"), trash: special("\\Trash") };
+  account.folders = { inbox: special("\\Inbox") ?? "INBOX", sent: special("\\Sent"), drafts: special("\\Drafts"), trash: special("\\Trash"), archive: special("\\Archive") };
   const calendar = new CalendarClient(account, password);
   const calendars = await calendar.listCalendars();
   await setPassword(primaryEmail, password);
@@ -142,7 +169,7 @@ async function setup(values: Input) {
 }
 
 function localDateParts(date: Date, timezone: string): Record<string, number> {
-  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: timezone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hourCycle: "h23" }).formatToParts(date);
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: timezone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(date);
   return Object.fromEntries(parts.filter((part) => part.type !== "literal").map((part) => [part.type, Number(part.value)]));
 }
 
@@ -152,20 +179,42 @@ function zonedTime(year: number, month: number, day: number, hour: number, timez
   let instant = wanted;
   for (let i = 0; i < 3; i++) {
     const actual = localDateParts(new Date(instant), timezone);
-    const offset = wanted - Date.UTC(actual.year, actual.month - 1, actual.day, actual.hour);
+    const offset = wanted - Date.UTC(actual.year, actual.month - 1, actual.day, actual.hour, actual.minute);
     if (offset === 0) break;
     instant += offset;
   }
   return new Date(instant);
 }
 
-function freeTime(events: Array<{ start: string; end: string }>, start: string, end: string, startHour: number, endHour: number, minimumMinutes: number, timezone: string) {
+function calendarDate(value: string, timezone: string): Date {
+  const bareDate = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  const date = bareDate ? zonedTime(Number(bareDate[1]), Number(bareDate[2]), Number(bareDate[3]), 0, timezone) : new Date(value);
+  if (Number.isNaN(date.getTime())) throw new Error("Date must be a valid ISO date or date-time.");
+  return date;
+}
+
+function hour(value: unknown, name: string, fallback: number): number {
+  const result = number(value, fallback);
+  if (!Number.isInteger(result) || result < 0 || result > 23) throw new Error(`${name} must be an integer from 0 through 23.`);
+  return result;
+}
+
+function workDays(value: unknown): number[] {
+  if (value === undefined) return [1, 2, 3, 4, 5];
+  if (!Array.isArray(value) || !value.every((day) => typeof day === "number" && Number.isInteger(day) && day >= 0 && day <= 6)) throw new Error("workDays must be an array of weekdays numbered 0 (Sunday) through 6 (Saturday).");
+  return value;
+}
+
+function freeTime(events: Array<{ start: string; end: string }>, start: Date, end: Date, startHour: number, endHour: number, minimumMinutes: number, timezone: string, days: number[]) {
   const slots: Array<{ start: string; end: string }> = [];
-  const rangeStart = new Date(start);
-  const rangeEnd = new Date(end);
-  if (Number.isNaN(rangeStart.getTime()) || Number.isNaN(rangeEnd.getTime()) || rangeStart >= rangeEnd) throw new Error("start and end must be valid ISO dates with end after start.");
+  const rangeStart = start;
+  const rangeEnd = end;
+  if (rangeStart >= rangeEnd) throw new Error("end must be after start.");
+  if (endHour <= startHour) throw new Error("workDayEndHour must be after workDayStartHour.");
+  if (!Number.isInteger(minimumMinutes) || minimumMinutes < 1) throw new Error("minSlotMinutes must be a positive integer.");
   const first = localDateParts(rangeStart, timezone);
   for (let day = new Date(Date.UTC(first.year, first.month - 1, first.day)); day < rangeEnd; day.setUTCDate(day.getUTCDate() + 1)) {
+    if (!days.includes(day.getUTCDay())) continue;
     const year = day.getUTCFullYear(), month = day.getUTCMonth() + 1, date = day.getUTCDate();
     const dayStart = new Date(Math.max(zonedTime(year, month, date, startHour, timezone).getTime(), rangeStart.getTime()));
     const dayEnd = new Date(Math.min(zonedTime(year, month, date, endHour, timezone).getTime(), rangeEnd.getTime()));
@@ -182,36 +231,36 @@ function freeTime(events: Array<{ start: string; end: string }>, start: string, 
   return slots;
 }
 
-async function run(command: string, values: Input): Promise<unknown> {
-  if (command === "setup") return setup(values);
+async function run(command: string, values: Input, source: InputSource): Promise<unknown> {
+  if (command === "setup") return setup(values, source);
   const { account, mail, calendar } = await clients();
   switch (command) {
     case "mail-folders": return mail.listFolders();
-    case "mail-list": return mail.listMessages(typeof values.folder === "string" ? values.folder : "inbox", number(values.limit, 20));
-    case "mail-search": return mail.search(typeof values.folder === "string" ? values.folder : "inbox", { text: typeof values.text === "string" ? values.text : undefined, from: typeof values.from === "string" ? values.from : undefined, subject: typeof values.subject === "string" ? values.subject : undefined, since: typeof values.since === "string" ? values.since : undefined, unseen: bool(values.unseen) }, number(values.limit, 20));
-    case "mail-read": return mail.readMessage(string(values.folder, "folder"), positiveInteger(values.uid, "uid"), bool(values.includeHtml) ?? false);
-    case "mail-search-threads": return mail.searchThreads({ text: typeof values.text === "string" ? values.text : undefined, from: typeof values.from === "string" ? values.from : undefined, subject: typeof values.subject === "string" ? values.subject : undefined, since: typeof values.since === "string" ? values.since : undefined, unseen: bool(values.unseen) }, number(values.limit, 20));
-    case "mail-mark": { const uids = integers(values.uids, "uids"); const action = string(values.action, "action"); if (!uids?.length || !["read", "unread", "flag", "unflag"].includes(action)) throw new Error("uids and a valid action are required."); await mail.mark(typeof values.folder === "string" ? values.folder : "inbox", uids, action as "read" | "unread" | "flag" | "unflag"); return { ok: true }; }
-    case "mail-move": { const uids = integers(values.uids, "uids"); if (!uids?.length) throw new Error("uids must contain at least one UID."); await mail.move(typeof values.folder === "string" ? values.folder : "inbox", uids, string(values.destination, "destination")); return { ok: true }; }
+    case "mail-list": return mail.listMessages(typeof values.folder === "string" ? values.folder : "inbox", positiveInteger(values.limit ?? 20, "limit"));
+    case "mail-search": return mail.search(typeof values.folder === "string" ? values.folder : "inbox", { text: typeof values.text === "string" ? values.text : undefined, from: typeof values.from === "string" ? values.from : undefined, subject: typeof values.subject === "string" ? values.subject : undefined, since: typeof values.since === "string" ? values.since : undefined, unseen: bool(values.unseen) }, positiveInteger(values.limit ?? 20, "limit"));
+    case "mail-read": return mail.readMessage(string(values.folder, "folder"), positiveInteger(values.uid, "uid"), bool(values.includeHtml) ?? false, positiveInteger(values.maxBytes ?? 1_000_000, "maxBytes"));
+    case "mail-search-threads": return mail.searchThreads({ text: typeof values.text === "string" ? values.text : undefined, from: typeof values.from === "string" ? values.from : undefined, subject: typeof values.subject === "string" ? values.subject : undefined, since: typeof values.since === "string" ? values.since : undefined, unseen: bool(values.unseen) }, positiveInteger(values.limit ?? 20, "limit"));
+    case "mail-mark": { const uids = integers(values.uids, "uids"); const action = string(values.action, "action"); if (!uids?.length || !["read", "unread", "flag", "unflag"].includes(action)) throw new Error("uids and a valid action are required."); await mail.mark(string(values.folder, "folder"), uids, action as "read" | "unread" | "flag" | "unflag"); return { ok: true }; }
+    case "mail-move": { const uids = integers(values.uids, "uids"); if (!uids?.length) throw new Error("uids must contain at least one UID."); await mail.move(string(values.folder, "folder"), uids, string(values.destination, "destination")); return { ok: true }; }
     case "mail-attachments": return mail.listAttachments(string(values.folder, "folder"), positiveInteger(values.uid, "uid"));
-    case "mail-attachment-get": return mail.downloadAttachment(string(values.folder, "folder"), positiveInteger(values.uid, "uid"), nonNegativeInteger(values.index, "index"));
-    case "mail-thread": return mail.getThread(string(values.folder, "folder"), positiveInteger(values.uid, "uid"), number(values.limit, 100));
+    case "mail-attachment-get": return mail.downloadAttachment(string(values.folder, "folder"), positiveInteger(values.uid, "uid"), nonNegativeInteger(values.index, "index"), positiveInteger(values.maxBytes ?? 1_000_000, "maxBytes"));
+    case "mail-thread": return mail.getThread(string(values.folder, "folder"), positiveInteger(values.uid, "uid"), positiveInteger(values.limit ?? 100, "limit"));
     case "mail-send": {
       const to = strings(values.to, "to");
       if (!to?.length) throw new Error("to must contain at least one recipient.");
       return mail.send({ to, cc: strings(values.cc, "cc"), bcc: strings(values.bcc, "bcc"), subject: string(values.subject, "subject"), text: string(values.body, "body"), inReplyTo: typeof values.inReplyTo === "string" ? values.inReplyTo : undefined, references: strings(values.references, "references"), saveToFolder: "sent" });
     }
     case "calendar-calendars": return calendar.calendarInfos();
-    case "calendar-list": return calendar.listEvents(new Date(string(values.start, "start")), new Date(string(values.end, "end")), typeof values.calendarUrl === "string" ? values.calendarUrl : undefined);
+    case "calendar-list": return calendar.listEvents(calendarDate(string(values.start, "start"), account.timezone), calendarDate(string(values.end, "end"), account.timezone), typeof values.calendarUrl === "string" ? values.calendarUrl : undefined);
     case "calendar-get": return calendar.getEvent(string(values.url, "url"), typeof values.calendarUrl === "string" ? values.calendarUrl : undefined);
-    case "calendar-search": return calendar.searchEvents(new Date(string(values.start, "start")), new Date(string(values.end, "end")), string(values.text, "text"), typeof values.calendarUrl === "string" ? values.calendarUrl : undefined);
-    case "calendar-create": return calendar.createEvent({ summary: string(values.summary, "summary"), start: new Date(string(values.start, "start")), end: new Date(string(values.end, "end")), allDay: bool(values.allDay), location: typeof values.location === "string" ? values.location : undefined, description: typeof values.description === "string" ? values.description : undefined }, typeof values.calendarUrl === "string" ? values.calendarUrl : undefined);
-    case "calendar-update": return calendar.updateEvent({ url: string(values.url, "url"), etag: typeof values.etag === "string" ? values.etag : undefined, summary: typeof values.summary === "string" ? values.summary : undefined, start: typeof values.start === "string" ? new Date(values.start) : undefined, end: typeof values.end === "string" ? new Date(values.end) : undefined, allDay: bool(values.allDay), location: typeof values.location === "string" ? values.location : undefined, description: typeof values.description === "string" ? values.description : undefined }, typeof values.calendarUrl === "string" ? values.calendarUrl : undefined);
-    case "calendar-delete": return calendar.deleteEvent(string(values.url, "url"), typeof values.etag === "string" ? values.etag : undefined);
+    case "calendar-search": return calendar.searchEvents(calendarDate(string(values.start, "start"), account.timezone), calendarDate(string(values.end, "end"), account.timezone), string(values.text, "text"), typeof values.calendarUrl === "string" ? values.calendarUrl : undefined);
+    case "calendar-create": return calendar.createEvent({ summary: string(values.summary, "summary"), start: calendarDate(string(values.start, "start"), account.timezone), end: calendarDate(string(values.end, "end"), account.timezone), allDay: bool(values.allDay), location: typeof values.location === "string" ? values.location : undefined, description: typeof values.description === "string" ? values.description : undefined }, typeof values.calendarUrl === "string" ? values.calendarUrl : undefined);
+    case "calendar-update": await calendar.updateEvent({ url: string(values.url, "url"), etag: string(values.etag, "etag"), summary: typeof values.summary === "string" ? values.summary : undefined, start: typeof values.start === "string" ? calendarDate(values.start, account.timezone) : undefined, end: typeof values.end === "string" ? calendarDate(values.end, account.timezone) : undefined, allDay: bool(values.allDay), allowSeriesUpdate: bool(values.allowSeriesUpdate), location: typeof values.location === "string" ? values.location : undefined, description: typeof values.description === "string" ? values.description : undefined }, typeof values.calendarUrl === "string" ? values.calendarUrl : undefined); return { ok: true };
+    case "calendar-delete": await calendar.deleteEvent(string(values.url, "url"), string(values.etag, "etag"), typeof values.calendarUrl === "string" ? values.calendarUrl : undefined); return { ok: true };
     case "calendar-invite": {
       const attendees = strings(values.attendees, "attendees");
       if (!attendees?.length) throw new Error("attendees must contain at least one email address.");
-      return calendar.sendInvite({ summary: string(values.summary, "summary"), start: new Date(string(values.start, "start")), end: new Date(string(values.end, "end")), attendees, allDay: bool(values.allDay), location: typeof values.location === "string" ? values.location : undefined, description: typeof values.description === "string" ? values.description : undefined });
+      return calendar.sendInvite({ summary: string(values.summary, "summary"), start: calendarDate(string(values.start, "start"), account.timezone), end: calendarDate(string(values.end, "end"), account.timezone), attendees, allDay: bool(values.allDay), location: typeof values.location === "string" ? values.location : undefined, description: typeof values.description === "string" ? values.description : undefined });
     }
     case "calendar-respond": {
       const response = string(values.response, "response");
@@ -220,9 +269,10 @@ async function run(command: string, values: Input): Promise<unknown> {
       return { ok: true };
     }
     case "calendar-free": {
-      const start = string(values.start, "start"), end = string(values.end, "end");
-      const events = await calendar.listEvents(new Date(start), new Date(end));
-      return freeTime(events, start, end, number(values.workDayStartHour, 9), number(values.workDayEndHour, 18), number(values.minSlotMinutes, 30), account.timezone);
+      const start = calendarDate(string(values.start, "start"), account.timezone), end = calendarDate(string(values.end, "end"), account.timezone);
+      const events = await calendar.listEvents(start, end);
+      const blockingEvents = events.filter((event) => event.status !== "CANCELLED" && !event.transparent);
+      return freeTime(blockingEvents, start, end, hour(values.workDayStartHour, "workDayStartHour", 9), hour(values.workDayEndHour, "workDayEndHour", 18), positiveInteger(values.minSlotMinutes ?? 30, "minSlotMinutes"), account.timezone, workDays(values.workDays));
     }
     default: throw new Error(`Unknown command: ${command}`);
   }
@@ -233,4 +283,5 @@ if (!command || ["--help", "help"].includes(command)) {
   console.error("Usage: groupware <setup|mail-folders|mail-list|mail-search|mail-read|mail-search-threads|mail-mark|mail-move|mail-attachments|mail-attachment-get|mail-thread|mail-send|calendar-calendars|calendar-list|calendar-get|calendar-search|calendar-create|calendar-update|calendar-delete|calendar-invite|calendar-respond|calendar-free> [JSON input]");
   process.exit(command ? 0 : 1);
 }
-run(command, await readInput()).then((result) => console.log(JSON.stringify(result, null, 2))).catch((error) => { console.error(JSON.stringify({ error: error instanceof Error ? error.message : String(error) })); process.exit(1); });
+const suppliedInput = await readInput();
+run(command, suppliedInput.values, suppliedInput.source).then((result) => console.log(JSON.stringify(result, null, 2))).catch((error) => { console.error(JSON.stringify({ error: error instanceof Error ? error.message : String(error) })); process.exit(1); });
